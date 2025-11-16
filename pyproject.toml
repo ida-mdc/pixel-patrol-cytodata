@@ -1,0 +1,21 @@
+[project]
+name = "pixel-patrol-cytodata"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pixel_patrol_base>=0.1.1",
+    "pixel_patrol_image>=0.1.2",
+    "pixel_patrol_loader_bio>=0.1.2"
+]
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pixel_patrol_cytodata"]
+
+[project.entry-points."pixel_patrol.loader_plugins"]
+my_extension_loaders = "pixel_patrol_cytodata.plugin_registry:register_loader_plugins"
+
