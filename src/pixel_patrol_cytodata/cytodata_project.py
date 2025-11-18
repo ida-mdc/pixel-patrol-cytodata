@@ -2,7 +2,7 @@ import logging
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Union, Iterable, Optional, Set, Dict, Any
+from typing import List, Union, Iterable, Optional, Set, Dict, Any, Tuple
 
 import polars as pl
 import requests
@@ -10,17 +10,13 @@ import requests
 from tqdm.auto import tqdm
 
 from pixel_patrol_base.core.contracts import PixelPatrolLoader, PixelPatrolProcessor
-from pixel_patrol_base.core.project_settings import Settings
+from pixel_patrol_base.core.project_settings import Settings as PP_settings
 from pixel_patrol_base.core.specs import is_record_matching_processor
 from pixel_patrol_base.plugin_registry import discover_loader, discover_processor_plugins
 
-# ---
+from pixel_patrol_cytodata.settings import CytoDataSettings, S3_NAMESPACE
 
 logger = logging.getLogger(__name__)
-
-S3_NAMESPACE = "{http://s3.amazonaws.com/doc/2006-03-01/}"
-MAX_PARALLEL_WORKERS = 8  # Number of parallel threads to download/process images
-
 
 def _find_s3_files(s3_folder_url: str, file_suffixes: List[str]) -> List[str]:
     """
@@ -69,23 +65,6 @@ def _find_s3_files(s3_folder_url: str, file_suffixes: List[str]) -> List[str]:
     return file_urls
 
 
-class CytoDataSettings(Settings):
-    """ Project settings specific to CytoData projects. """
-
-    comparison_filters: Optional[Dict[str, pl.Expr]]
-    sample_per_group: int
-
-    def __init__(
-            self,
-            comparison_filters: Optional[Dict[str, pl.Expr]] = None,
-            sample_per_group: int = 50,  # Default value
-            **kwargs: Any
-    ):
-        super().__init__(**kwargs)
-        self.comparison_filters = comparison_filters
-        self.sample_per_group = sample_per_group
-
-
 def _standardize_well_format(well: Optional[str]) -> Optional[str]:
     """
     Safely standardizes well names from 'A1' to 'A01'.
@@ -111,12 +90,14 @@ class CytoDataProject:
     Cell Painting gallery datasets (e.g., cpg0036).
     """
 
-    def __init__(self, name: str, base_dir: str, loader: str):
+    def __init__(self, name: str, base_dir: str, loader: str, use_local: bool = True):
         self.name: str = name
         self.base_dir: str = base_dir
         self.paths: Set[str] = set()
+        self.use_local = use_local
         self.loader: Optional[PixelPatrolLoader] = discover_loader(loader)
         self.settings: CytoDataSettings = CytoDataSettings()
+        self.pp_settings: PP_settings = PP_settings()
         self.records_df: Optional[pl.DataFrame] = None
         self.cache_dir: str = str(Path.cwd() / "cytodata_cache")
         Path(self.cache_dir).mkdir(exist_ok=True)
@@ -138,13 +119,19 @@ class CytoDataProject:
         self.paths.update(paths)
         logger.info(f"Project Core: Paths updated. Total paths count: {len(self.paths)}.")
 
-    def set_settings(self, settings: Settings) -> None:
-        if not isinstance(settings, CytoDataSettings):
-            logger.warning("Settings are not an instance of CytoDataSettings. "
+    def set_settings(self, settings: PP_settings) -> None:
+        if not isinstance(settings, PP_settings):
+            logger.warning("Settings are not an instance of PP project settings. "
                            "Using as-is, but this may cause issues.")
 
+        self.pp_settings = settings
+        logger.info(f"Project Core: PP Project settings updated for '{self.name}'.")
+
+    def set_cd_settings(self, settings: CytoDataSettings) -> None:
         self.settings = settings
-        logger.info(f"Project Core: Project settings updated for '{self.name}'.")
+
+        self.use_local = (self.settings.data_source == "local")
+        logger.info(f"CytoData settings updated. use_local={self.use_local}")
 
     def _scan_s3_for_manifests(self) -> List[str]:
         """Scans all registered S3 paths for 'load_data.csv' files."""
@@ -297,18 +284,27 @@ class CytoDataProject:
             except Exception as e:
                 logger.warning(f"Failed to load manifest cache: {e}. Re-scanning S3.")
 
-        all_manifest_paths = self._scan_s3_for_manifests()
+        if self.use_local:
+            all_manifest_paths = self._scan_local_for_manifests()
+        else:
+            all_manifest_paths = self._scan_s3_for_manifests()
+
+
         if not all_manifest_paths:
-            logger.error("No manifest files (load_data.csv) found during S3 scan.")
+            logger.error("No manifest files (load_data.csv) found during scan.")
             return pl.DataFrame()
 
         logger.info(f"Found {len(all_manifest_paths)} total manifest files.")
 
         manifest_dfs = []
-        for path in tqdm(all_manifest_paths, desc="Reading S3 manifests"):
+        for path in tqdm(all_manifest_paths, desc="Reading manifests"):
+
             try:
-                # Add ignore_errors=True for robustness
-                df = pl.read_csv(path, storage_options={"anon": True}, ignore_errors=True)
+                if self.use_local:
+                    df = pl.read_csv(path, ignore_errors=True)
+                else:
+                    df = pl.read_csv(path, storage_options={"anon": True}, ignore_errors=True)
+
                 df = self._standardize_manifest_cols(df)
 
                 if "Metadata_Provider" not in df.columns:
@@ -370,37 +366,43 @@ class CytoDataProject:
             except Exception as e:
                 logger.warning(f"Failed to load platemap cache: {e}. Re-scanning S3.")
 
-        all_platemap_paths = self._scan_s3_for_platemaps()
+        if self.use_local:
+            all_platemap_paths = self._scan_local_for_platemaps()
+        else:
+            all_platemap_paths = self._scan_s3_for_platemaps()
         if not all_platemap_paths:
-            logger.error("No platemap files found during S3 scan.")
+            logger.error("No platemap files found during scan.")
             return pl.DataFrame()
 
         logger.info(f"Found {len(all_platemap_paths)} total platemap files. Filtering for valid platemaps...")
 
         platemap_dfs = []
 
-        for path in tqdm(all_platemap_paths, desc="Reading S3 platemaps"):
-            df = None
+        for path in tqdm(all_platemap_paths, desc="Reading platemaps"):
             try:
                 path_lower = path.lower()
+                is_s3 = path_lower.startswith("s3://") or path_lower.startswith("https://")
+
+                read_args = dict(ignore_errors=True)
+                if not self.use_local and is_s3:
+                    read_args["storage_options"] = {"anon": True}
 
                 if path_lower.endswith(".tsv"):
-                    df = pl.read_csv(path, storage_options={"anon": True}, separator="\t", ignore_errors=True)
+                    df = pl.read_csv(path, separator="\t", **read_args)
 
                 elif path_lower.endswith(".txt"):
                     logger.debug(f"Reading space-delimited file: {path}")
-                    df = pl.read_csv(path, storage_options={"anon": True}, separator=" ", has_header=True,
-                                     ignore_errors=True)
+                    df = pl.read_csv(path, separator=" ", has_header=True, **read_args)
 
                 elif path_lower.endswith(".csv"):
-                    df = pl.read_csv(path, storage_options={"anon": True}, separator=",", ignore_errors=True)
+                    df = pl.read_csv(path, separator=",", **read_args)
 
                 else:
                     logger.debug(f"Skipping file with unhandled extension: {path}")
                     continue
 
             except Exception as e:
-                logger.warning(f"Failed to *read* file {path}: {e}")
+                logger.warning(f"Failed to read file {path}: {e}")
                 continue
 
             if df is None or df.is_empty():
@@ -570,6 +572,17 @@ class CytoDataProject:
 
         # Get the final list of paths to process
         try:
+            if self.use_local:
+                self.records_df = self.records_df.with_columns(
+                    pl.when(pl.col("URL_OrigDNA").str.starts_with(self.settings.s3_prefix))
+                    .then(
+                        pl.col("URL_OrigDNA")
+                        .str.replace(self.settings.s3_prefix, self.settings.local_prefix, literal=True)
+                    )
+                    .otherwise(pl.col("URL_OrigDNA"))
+                    .alias("URL_OrigDNA")
+                )
+
             self.records_df = self.records_df.with_columns([
                 pl.col("URL_OrigDNA").alias("path"),
                 pl.col("URL_OrigDNA").str.split("/").list.last().alias("name")
@@ -590,7 +603,7 @@ class CytoDataProject:
 
         processor_rows = []
 
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=self.settings.max_parallel_workers) as executor:
             futures = {executor.submit(self._process_single_record, path): path for path in paths_to_process}
 
             for future in tqdm(as_completed(futures), total=len(paths_to_process), desc="Running processors",
@@ -700,16 +713,20 @@ class CytoDataProject:
                 logger.info(f"\n{self.records_df['imported_path_short'].value_counts(sort=True)}")
 
         else:
-            logger.warning("No comparison filters set. DataFrame may be very large.")
-            return self
+            logger.info("No comparison filters set; proceeding without grouping.")
+            if self.settings.sample_per_group and self.settings.sample_per_group > 0:
+                n = min(self.settings.sample_per_group, len(self.records_df))
+                logger.info(f"Sampling {n} records (global).")
+                self.records_df = self.records_df.sample(n=n, with_replacement=False, seed=42)
 
         processor_df = self._run_deep_processing()
 
         if not processor_df.is_empty():
             logger.info(f"Records df shape: {self.records_df.shape}")
-            logger.info(f"Records df unique paths: {self.records_df.n_unique(subset=["path"])}")
+            logger.info(f"Records df unique paths: {self.records_df.select(pl.col('path').n_unique()).item()}")
             logger.info(f"Processor df shape: {processor_df.shape}")
-            logger.info(f"Processor df unique paths: {processor_df.n_unique(subset=["path"])}")
+            logger.info(f"Processor df unique paths: {processor_df.select(pl.col('path').n_unique()).item()}")
+
             logger.info("Joining processor metadata back to main DataFrame...")
             try:
                 self.records_df = self.records_df.join(
@@ -724,6 +741,38 @@ class CytoDataProject:
 
         return self
 
+    def add_manifest_dirs_from_csv(self, csv_path: str) -> None:
+        df = pl.read_csv(csv_path)
+        if "manifest_dir" not in df.columns:
+            raise ValueError("CSV must contain a 'manifest_dir' column")
+        self.add_paths(df["manifest_dir"].to_list())  # reuse existing API
+
+    def _scan_local_for_manifests(self) -> list[str]:
+        """Find local load_data.csv files."""
+        files = []
+        for p in self.paths:
+            mp = Path(p) / "load_data.csv"
+            if mp.exists():
+                files.append(str(mp))
+        return files
+
+    def _scan_local_for_platemaps(self) -> list[str]:
+        files = set()
+        for p in self.paths:
+            parts: Tuple[str, ...] = Path(p).parts  # or: parts: tuple[str, ...] = Path(p).parts
+            if "workspace" in parts:
+                wi = parts.index("workspace")
+                prov = parts[wi - 1] if wi > 0 else None
+            else:
+                prov = None
+            if prov is None:
+                continue
+            meta = Path(self.base_dir) / prov / "workspace" / "metadata"
+            for ext in ("*.csv", "*.tsv", "*.txt"):
+                files.update(map(str, meta.rglob(ext)))
+        return list(files)
+
+
     # --- Getters ---
     def get_name(self) -> str:
         return self.name
@@ -731,7 +780,10 @@ class CytoDataProject:
     def get_paths(self) -> Set[str]:
         return self.paths
 
-    def get_settings(self) -> Settings:
+    def get_settings(self) -> PP_settings:
+        return self.pp_settings
+
+    def get_cd_settings(self) -> CytoDataSettings:
         return self.settings
 
     def get_records_df(self) -> Optional[pl.DataFrame]:
